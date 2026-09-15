@@ -9,7 +9,9 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
 
+import requests
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -26,10 +28,14 @@ from aiogram.types import (
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")          # токен берём из переменной окружения
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")    # ключ Groq для расшифровки (Whisper)
 CHANNEL_USERNAME = "@times_officialuz"      # канал, на который нужна подписка
 CHANNEL_LINK = "https://t.me/times_officialuz"
 MAX_FILE_SIZE = 50 * 1024 * 1024            # лимит Telegram Bot API — 50 МБ
 # ===============================================
+
+# Память для кнопки «Расшифровка»: короткий id -> ссылка на видео
+transcribe_urls: dict[str, str] = {}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -101,6 +107,43 @@ def download_media(url: str, tmp_dir: str) -> list[str]:
     return files
 
 
+def download_audio(url: str, tmp_dir: str) -> str | None:
+    """Скачивает только аудиодорожку и сжимает её в mp3 для расшифровки."""
+    ydl_opts = {
+        "outtmpl": os.path.join(tmp_dir, "audio.%(ext)s"),
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "64",  # 64 кбит/с достаточно для распознавания речи
+            }
+        ],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    audio_path = os.path.join(tmp_dir, "audio.mp3")
+    return audio_path if os.path.exists(audio_path) else None
+
+
+def transcribe_audio(audio_path: str) -> str:
+    """Отправляет аудио в Groq API (Whisper) и возвращает текст расшифровки."""
+    with open(audio_path, "rb") as f:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": ("audio.mp3", f, "audio/mpeg")},
+            data={"model": "whisper-large-v3", "response_format": "text"},
+            timeout=300,
+        )
+    response.raise_for_status()
+    return response.text.strip()
+
+
 def download_photos_gallery_dl(url: str, tmp_dir: str) -> list[str]:
     """
     Запасной вариант для фото-постов (Instagram, X):
@@ -130,6 +173,8 @@ async def cmd_start(message: Message):
             "🎵 TikTok\n"
             "🐦 X (Twitter)\n"
             "▶️ YouTube Shorts\n\n"
+            "А ещё умею делать 📝 текстовую расшифровку речи из видео — "
+            "кнопка появится под скачанным роликом.\n\n"
             "Просто отправь мне ссылку 🔗"
         )
     else:
@@ -149,6 +194,52 @@ async def check_subscription(callback: CallbackQuery):
         )
     else:
         await callback.answer("❌ Ты ещё не подписался на канал!", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("tr:"))
+async def handle_transcribe(callback: CallbackQuery):
+    """Нажатие на кнопку «📝 Расшифровка» под видео."""
+    if not await is_subscribed(callback.from_user.id):
+        await callback.answer("🔒 Сначала подпишись на канал!", show_alert=True)
+        return
+
+    url_id = callback.data.split(":", 1)[1]
+    url = transcribe_urls.get(url_id)
+    if not url:
+        await callback.answer(
+            "⏰ Кнопка устарела. Отправь ссылку ещё раз.", show_alert=True
+        )
+        return
+
+    await callback.answer("⏳ Делаю расшифровку...")
+    status_msg = await callback.message.reply("🎙 Извлекаю аудио и распознаю речь...")
+    tmp_dir = tempfile.mkdtemp()
+
+    try:
+        loop = asyncio.get_running_loop()
+        audio_path = await loop.run_in_executor(None, download_audio, url, tmp_dir)
+        if not audio_path:
+            await status_msg.edit_text("😔 Не удалось извлечь аудио из этого видео.")
+            return
+
+        text = await loop.run_in_executor(None, transcribe_audio, audio_path)
+        if not text:
+            await status_msg.edit_text("🔇 Похоже, в этом видео нет речи.")
+            return
+
+        # Telegram ограничивает сообщение 4096 символами — режем на части
+        header = "📝 <b>Расшифровка:</b>\n\n"
+        chunk_size = 4000
+        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+        await status_msg.edit_text(header + chunks[0])
+        for chunk in chunks[1:]:
+            await callback.message.reply(chunk)
+
+    except Exception as e:
+        logger.error(f"Ошибка расшифровки: {e}")
+        await status_msg.edit_text("😔 Не получилось сделать расшифровку. Попробуй позже.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @dp.message(F.text)
@@ -206,11 +297,32 @@ async def handle_link(message: Message):
 
         caption = f"📥 Скачано через @{(await bot.get_me()).username}"
 
+        # Кнопка «Расшифровка» (показываем, только если задан ключ Groq)
+        transcribe_kb = None
+        if GROQ_API_KEY and videos:
+            url_id = uuid.uuid4().hex[:16]
+            transcribe_urls[url_id] = url
+            # чистим память, если ссылок стало слишком много
+            if len(transcribe_urls) > 1000:
+                for old_key in list(transcribe_urls)[:500]:
+                    transcribe_urls.pop(old_key, None)
+            transcribe_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📝 Расшифровка", callback_data=f"tr:{url_id}"
+                        )
+                    ]
+                ]
+            )
+
         for video in videos:
             if os.path.getsize(video) > MAX_FILE_SIZE:
                 await message.answer("⚠️ Видео больше 50 МБ — Telegram не даёт его отправить.")
                 continue
-            await message.answer_video(FSInputFile(video), caption=caption)
+            await message.answer_video(
+                FSInputFile(video), caption=caption, reply_markup=transcribe_kb
+            )
 
         # Фото отправляем альбомами по 10 штук
         for i in range(0, len(photos), 10):
