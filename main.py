@@ -76,10 +76,10 @@ async def is_subscribed(user_id: int) -> bool:
         return False
 
 
-def download_media(url: str, tmp_dir: str) -> list[str]:
+def download_media(url: str, tmp_dir: str) -> tuple[list[str], str]:
     """
     Скачивает видео (или фото) через yt-dlp.
-    Возвращает список путей к скачанным файлам.
+    Возвращает (список файлов, описание поста).
     Работает в отдельном потоке, чтобы не блокировать бота.
     """
     ydl_opts = {
@@ -97,14 +97,24 @@ def download_media(url: str, tmp_dir: str) -> list[str]:
         "merge_output_format": "mp4",
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        info = ydl.extract_info(url, download=True)
+
+    # Вытаскиваем описание поста из метаданных
+    description = ""
+    if info:
+        # для плейлистов/каруселей берём метаданные первого элемента
+        if "entries" in info and info["entries"]:
+            first = info["entries"][0] or {}
+            description = first.get("description") or first.get("title") or ""
+        else:
+            description = info.get("description") or info.get("title") or ""
 
     files = [
         os.path.join(tmp_dir, f)
         for f in os.listdir(tmp_dir)
         if os.path.isfile(os.path.join(tmp_dir, f))
     ]
-    return files
+    return files, description.strip()
 
 
 def download_audio(url: str, tmp_dir: str) -> str | None:
@@ -144,6 +154,28 @@ def transcribe_audio(audio_path: str) -> str:
     return response.text.strip()
 
 
+def get_caption_gallery_dl(url: str) -> str:
+    """Пытается достать текст поста через метаданные gallery-dl (для фото-постов)."""
+    import json
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["gallery-dl", "-j", url], capture_output=True, timeout=60, text=True
+        )
+        data = json.loads(result.stdout)
+        # gallery-dl возвращает список [тип, метаданные, ...] — ищем текст поста
+        for item in data:
+            if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict):
+                meta = item[1]
+                for key in ("description", "content", "caption", "title"):
+                    if meta.get(key):
+                        return str(meta[key]).strip()
+    except Exception as e:
+        logger.info(f"Не удалось получить описание через gallery-dl: {e}")
+    return ""
+
+
 def download_photos_gallery_dl(url: str, tmp_dir: str) -> list[str]:
     """
     Запасной вариант для фото-постов (Instagram, X):
@@ -173,8 +205,8 @@ async def cmd_start(message: Message):
             "🎵 TikTok\n"
             "🐦 X (Twitter)\n"
             "▶️ YouTube Shorts\n\n"
-            "А ещё умею делать 📝 текстовую расшифровку речи из видео — "
-            "кнопка появится под скачанным роликом.\n\n"
+            "А ещё я присылаю 📄 описание поста вместе с медиа и умею делать "
+            "📝 текстовую расшифровку речи из видео — кнопка появится под роликом.\n\n"
             "Просто отправь мне ссылку 🔗"
         )
     else:
@@ -273,8 +305,11 @@ async def handle_link(message: Message):
 
         # Сначала пробуем yt-dlp (видео)
         files = []
+        description = ""
         try:
-            files = await loop.run_in_executor(None, download_media, url, tmp_dir)
+            files, description = await loop.run_in_executor(
+                None, download_media, url, tmp_dir
+            )
         except Exception as e:
             logger.info(f"yt-dlp не справился ({e}), пробую gallery-dl...")
 
@@ -283,6 +318,10 @@ async def handle_link(message: Message):
             files = await loop.run_in_executor(
                 None, download_photos_gallery_dl, url, tmp_dir
             )
+            if files and not description:
+                description = await loop.run_in_executor(
+                    None, get_caption_gallery_dl, url
+                )
 
         if not files:
             await status_msg.edit_text(
@@ -295,7 +334,22 @@ async def handle_link(message: Message):
         videos = [f for f in files if f.lower().endswith((".mp4", ".mov", ".webm", ".mkv"))]
         photos = [f for f in files if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
 
-        caption = f"📥 Скачано через @{(await bot.get_me()).username}"
+        # Собираем подпись: описание поста + подпись бота
+        import html as html_lib
+
+        bot_tag = f"📥 Скачано через @{(await bot.get_me()).username}"
+        long_description = None  # описание, которое не влезло в подпись
+
+        if description:
+            safe_desc = html_lib.escape(description)
+            # Лимит подписи в Telegram — 1024 символа (с запасом берём меньше)
+            if len(safe_desc) + len(bot_tag) + 10 <= 1000:
+                caption = f"{safe_desc}\n\n{bot_tag}"
+            else:
+                caption = bot_tag
+                long_description = safe_desc
+        else:
+            caption = bot_tag
 
         # Кнопка «Расшифровка» (показываем, только если задан ключ Groq)
         transcribe_kb = None
@@ -333,6 +387,18 @@ async def handle_link(message: Message):
                 media = [InputMediaPhoto(media=FSInputFile(p)) for p in chunk]
                 media[0].caption = caption
                 await message.answer_media_group(media)
+
+        # Если описание было слишком длинным для подписи — шлём отдельно
+        if long_description:
+            header = "📄 <b>Описание поста:</b>\n\n"
+            chunk_size = 4000
+            desc_chunks = [
+                long_description[i : i + chunk_size]
+                for i in range(0, len(long_description), chunk_size)
+            ]
+            await message.answer(header + desc_chunks[0])
+            for chunk in desc_chunks[1:]:
+                await message.answer(chunk)
 
         await status_msg.delete()
 
