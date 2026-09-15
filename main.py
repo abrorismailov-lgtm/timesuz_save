@@ -29,8 +29,14 @@ from aiogram.types import (
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")          # токен берём из переменной окружения
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")    # ключ Groq для расшифровки (Whisper)
-CHANNEL_USERNAME = "@times_officialuz"      # канал, на который нужна подписка
-CHANNEL_LINK = "https://t.me/times_officialuz"
+
+# Каналы, на которые нужна подписка (бот должен быть админом в КАЖДОМ!)
+REQUIRED_CHANNELS = [
+    {"username": "@times_officialuz", "link": "https://t.me/times_officialuz", "title": "Times Official"},
+    {"username": "@safarblog", "link": "https://t.me/safarblog", "title": "Safar Blog"},
+    {"username": "@burgutuzb", "link": "https://t.me/burgutuzb", "title": "Burgut UZ"},
+]
+
 MAX_FILE_SIZE = 50 * 1024 * 1024            # лимит Telegram Bot API — 50 МБ
 # ===============================================
 
@@ -53,27 +59,41 @@ URL_PATTERN = re.compile(
 )
 
 
-def subscribe_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_LINK)],
-            [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
-        ]
-    )
+async def get_unsubscribed_channels(user_id: int) -> list[dict]:
+    """Возвращает список каналов, на которые пользователь ещё НЕ подписан."""
+    unsubscribed = []
+    for channel in REQUIRED_CHANNELS:
+        try:
+            member = await bot.get_chat_member(channel["username"], user_id)
+            if member.status not in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+            ):
+                unsubscribed.append(channel)
+        except Exception as e:
+            logger.warning(f"Не удалось проверить подписку на {channel['username']}: {e}")
+            unsubscribed.append(channel)
+    return unsubscribed
 
 
 async def is_subscribed(user_id: int) -> bool:
-    """Проверяем, подписан ли пользователь на канал."""
-    try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR,
-        )
-    except Exception as e:
-        logger.warning(f"Не удалось проверить подписку: {e}")
-        return False
+    """Проверяем, подписан ли пользователь на ВСЕ обязательные каналы."""
+    return not await get_unsubscribed_channels(user_id)
+
+
+def subscribe_keyboard(channels: list[dict] | None = None) -> InlineKeyboardMarkup:
+    """Кнопки подписки. Если передан список — показываем только недостающие каналы."""
+    if channels is None:
+        channels = REQUIRED_CHANNELS
+    rows = [
+        [InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch["link"])]
+        for ch in channels
+    ]
+    rows.append(
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def download_media(url: str, tmp_dir: str) -> tuple[list[str], str]:
@@ -198,7 +218,8 @@ def download_photos_gallery_dl(url: str, tmp_dir: str) -> list[str]:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    if await is_subscribed(message.from_user.id):
+    unsubscribed = await get_unsubscribed_channels(message.from_user.id)
+    if not unsubscribed:
         await message.answer(
             "👋 Привет! Я умею скачивать видео и фото из:\n\n"
             "📸 Instagram (Reels, посты)\n"
@@ -211,28 +232,40 @@ async def cmd_start(message: Message):
         )
     else:
         await message.answer(
-            "👋 Привет! Чтобы пользоваться ботом, подпишись на наш канал 👇",
-            reply_markup=subscribe_keyboard(),
+            "👋 Привет! Чтобы пользоваться ботом, подпишись на наши каналы 👇\n\n"
+            "После подписки нажми «✅ Я подписался»",
+            reply_markup=subscribe_keyboard(unsubscribed),
         )
 
 
 @dp.callback_query(F.data == "check_sub")
 async def check_subscription(callback: CallbackQuery):
-    if await is_subscribed(callback.from_user.id):
+    unsubscribed = await get_unsubscribed_channels(callback.from_user.id)
+    if not unsubscribed:
         await callback.message.edit_text(
-            "✅ Отлично, подписка подтверждена!\n\n"
+            "✅ Отлично, все подписки подтверждены!\n\n"
             "Теперь просто отправь мне ссылку на видео или фото из "
             "Instagram, TikTok, X или YouTube Shorts 🔗"
         )
     else:
-        await callback.answer("❌ Ты ещё не подписался на канал!", show_alert=True)
+        names = ", ".join(ch["title"] for ch in unsubscribed)
+        await callback.answer(
+            f"❌ Ты ещё не подписался на: {names}", show_alert=True
+        )
+        # Обновляем клавиатуру — оставляем только недостающие каналы
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=subscribe_keyboard(unsubscribed)
+            )
+        except Exception:
+            pass  # если клавиатура не изменилась, Telegram вернёт ошибку — игнорируем
 
 
 @dp.callback_query(F.data.startswith("tr:"))
 async def handle_transcribe(callback: CallbackQuery):
     """Нажатие на кнопку «📝 Расшифровка» под видео."""
     if not await is_subscribed(callback.from_user.id):
-        await callback.answer("🔒 Сначала подпишись на канал!", show_alert=True)
+        await callback.answer("🔒 Сначала подпишись на все наши каналы!", show_alert=True)
         return
 
     url_id = callback.data.split(":", 1)[1]
@@ -276,11 +309,12 @@ async def handle_transcribe(callback: CallbackQuery):
 
 @dp.message(F.text)
 async def handle_link(message: Message):
-    # 1. Проверка подписки
-    if not await is_subscribed(message.from_user.id):
+    # 1. Проверка подписки на все каналы
+    unsubscribed = await get_unsubscribed_channels(message.from_user.id)
+    if unsubscribed:
         await message.answer(
-            "🔒 Для скачивания нужно подписаться на канал 👇",
-            reply_markup=subscribe_keyboard(),
+            "🔒 Для скачивания нужно подписаться на наши каналы 👇",
+            reply_markup=subscribe_keyboard(unsubscribed),
         )
         return
 
